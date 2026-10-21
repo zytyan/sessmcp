@@ -1,0 +1,8 @@
+/dist/
+/publish/
+/sessmcp-skill/
+*.log
+*.jsonl
+*.pem
+*.key
+.env
