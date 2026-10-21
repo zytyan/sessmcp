@@ -12,3 +12,8 @@
 - 可选 --log JSONL 审计 AI 输入；认证字段脱敏；审计文件权限 0600，stdout 专供 MCP。
 - 必须测试：真实 SSH 协议退出与双流、Telnet IAC 分包、交换机模拟器（分页、模式、慢输出）、半开端点、stdio 并发/取消/慢消费者与反压、race。
 - 用户已授权创建公开 GitHub 仓库与推送本项目。发布前不得包含凭据、审计日志或本地配置。
+
+- 现场反馈：缺失 SSH exit-status 不等于 transport 故障；返回 unknown outcome/warning，不能假定成功或自动重放。
+- SSH 网络设备推荐 interactive=true + line（默认 CR），保留原始 data 精确语义；禁止为了修复疑似 CRLF 问题静默修改 raw data。
+- 空输出/等待超时不代表未执行；返回 input_state/input_seq/input_bytes/next_action，并通过可选 input_id 对会话最近 128 个逻辑输入去重，未知发送也记录 ID。
+- 单次调用双警告不能直接定性为输入重复发送；要区分线上字节、终端 Enter 解释、回显与增量输出。未实测真实设备时不得声称已复现特定厂商问题。

@@ -118,16 +118,20 @@ func Tools() []any {
 	out := []any{map[string]any{"name": "sess_connect", "description": "Create persistent SSH/Telnet connection. Prefer non-interactive SSH exec on standard servers. Telnet is plaintext; use on trusted networks. No automatic reconnect or command replay.", "inputSchema": schema(connect, "protocol", "address")}}
 	for _, kind := range []string{"exec", "interact", "read"} {
 		p := map[string]any{"session": str("Handle returned by sess_connect"), "wait": str("Fixed time from call start; default 5s. Examples 100ms,30s,1min. Can exceed 115s but hard call cap is 115s."), "waitfor": str("Go RE2 regex matched against new combined stdout/stderr; OR with wait/timeout/SSH exit"), "timeout": str("Time since last stdout/stderr refresh, not since last input (e.g. 100ms). OR with wait/waitfor."), "all": map[string]any{"type": "boolean", "description": "Read retained history, at most 64KiB per result; use offset=end to paginate"}, "tail": map[string]any{"type": "integer", "minimum": 0, "maximum": 100000, "description": "Last N retained lines (64KiB response cap)"}, "offset": map[string]any{"type": "integer", "minimum": 0, "description": "Absolute byte offset for paging; dropped history is reported"}}
-		desc := "Wait/read without sending input; default incremental output. Check more/truncated/end, connected/error, running/exit_code. Hard deadline 115s; endpoint idle 110s disconnects."
+		desc := "Wait/read without sending input; an empty output after sent input never means failure or permission to resend; default incremental output. Check more/truncated/end, connected/error, running/exit_code. Hard deadline 115s; endpoint idle 110s disconnects."
 		req := []string{"session"}
 		if kind == "exec" {
 			p["command"] = str("SSH exec command, max 4096 bytes; new SSH channel on persistent transport. Shell state does not persist across exec calls.")
 			req = append(req, "command")
+			p["input_id"] = str("Unique ID for one logical input, max 128 bytes. Reuse same ID and input for retries to suppress duplicate sends in this session's last 128 IDs; never change the input under an existing ID.")
 			desc = "Preferred for standard SSH: start command and return immediately on SSH exit-status (combined stdout/stderr); OR wait/waitfor/timeout. If running=true, poll sess_read, never resubmit the command."
 		}
 		if kind == "interact" {
-			p["data"] = str("Exact input, max 4096 bytes; include \\r\\n or \\n for Enter. Send one small command per prompt; empty data polls.")
-			desc = "Send to persistent Telnet or interactive SSH shell. Use waitfor prompt/pager or timeout for silent terminals; any wait condition returns. Respect backpressure; never queue bulk input."
+			p["data"] = str("Exact raw input, max 4096 bytes. Prefer line for a command; for pager send a space. SSH raw Enter is usually \\r; CRLF can trigger two Enters on some terminals. Empty data polls.")
+			p["line"] = str("Recommended: one command without CR/LF; appends exactly the selected Enter sequence. Mutually exclusive with data. SSH defaults cr; Telnet defaults crlf.")
+			p["enter"] = map[string]any{"type": "string", "enum": []string{"cr", "lf", "crlf"}, "description": "Only with line. SSH device consoles: prefer cr; adjust only when device needs a different sequence."}
+			p["input_id"] = str("Unique ID per logical input, max 128 bytes. Reusing same ID and input suppresses retransmission within the last 128 IDs in this session, including uncertain/failed sends. No guarantee after reconnect/eviction.")
+			desc = "Send to persistent Telnet or interactive SSH shell. Use waitfor prompt/pager or timeout for silent terminals; any wait condition returns. Use line for one command and input_id for retry deduplication. If input_state=sent or unknown, poll sess_read even if output is empty. Respect backpressure; never queue bulk input."
 		}
 		out = append(out, map[string]any{"name": "sess_" + kind, "description": desc, "inputSchema": schema(p, req...)})
 	}
@@ -331,7 +335,7 @@ func (s *Server) Serve(parent context.Context, in io.Reader, out io.Writer) erro
 				default:
 					version = "2025-11-25"
 				}
-				send(m.ID, map[string]any{"protocolVersion": version, "capabilities": map[string]any{"tools": map[string]any{}}, "serverInfo": map[string]any{"name": "sessmcp", "version": "0.1.0"}, "instructions": "Prefer sess_exec for standard SSH. Device consoles: sess_interact with waitfor/timeout. Never blindly retry side-effecting commands. See backpressure/connected/more in every result."}, 0, "")
+				send(m.ID, map[string]any{"protocolVersion": version, "capabilities": map[string]any{"tools": map[string]any{}}, "serverInfo": map[string]any{"name": "sessmcp", "version": "0.1.0"}, "instructions": "Prefer sess_exec for standard SSH. Device consoles: interactive=true, sess_interact with line (SSH CR), input_id and waitfor/timeout. Empty output never means unsent: inspect input_state and next_action, then sess_read. Never blindly replay commands."}, 0, "")
 			case "ping":
 				send(m.ID, map[string]any{}, 0, "")
 			case "tools/list":

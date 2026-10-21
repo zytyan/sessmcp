@@ -29,7 +29,7 @@ MCP 客户端配置（stdio，每行一条 JSON-RPC 消息）：
 |---|---|
 | `sess_connect` | 创建连接，返回 session；SSH 默认为非交互式 |
 | `sess_exec` | 普通 SSH 命令；使用协议退出状态，合并 stdout/stderr |
-| `sess_interact` | 向 SSH 前台 shell / Telnet 发送精确输入，换行需自行包含 |
+| `sess_interact` | 用 line 发送单行命令，或用 data 发送精确原始输入 |
 | `sess_read` | 不发送输入，继续等待、读取输出 |
 | `sess_list` | 列出连接、运行与断链状态 |
 | `sess_close` | 立即关闭并释放连接，不等待该会话的操作锁 |
@@ -50,7 +50,7 @@ SSH 连接示例：
 {"session":"HANDLE","command":"uname -a","wait":"30s"}
 ```
 
-若提前返回且 `running:true`，使用 `sess_read` 等待原命令；不要重新提交。非零退出码通过 `exit_code` 返回，与传输故障区分。
+若提前返回且 `running:true`，使用 `sess_read` 等待原命令；不要重新提交。非零退出码通过 `exit_code` 返回，与传输故障区分。若通道关闭但未返回 exit-status/exit-signal，返回 `reason:exit_status_missing` 和 warning，保留输出、令 exit_code 缺省并保留 transport；不会把未知结果当作成功，也不会仅为缺失状态而断开整个连接。SSH 规范将退出状态报告作为建议行为，未返回它不等于 transport 断链。后续网络设备命令应使用交互模式，不能自动补执行已经输出结果的命令。
 
 ## 交换机、路由器、Telnet
 
@@ -63,10 +63,25 @@ SSH 连接设置 `interactive:true`；Telnet 连接天然是交互式。Telnet �
 查看 connect 返回的初始输出，必要时用 sess_read 等待提示符；随后调用 sess_interact：
 
 ```json
-{"session":"HANDLE","data":"show version\r\n","waitfor":"(?m)switch[#>]\\s*$","timeout":"800ms","wait":"30s"}
+{"session":"HANDLE","line":"show version","input_id":"show-version-1","waitfor":"(?m)switch[#>]\\s*$","timeout":"800ms","wait":"30s"}
 ```
 
-匹配 `--More--` 后发送一个空格读取下一页。`data` 保留原样，内部 Telnet 编解码负责 IAC 转义；不自动追加回车。
+推荐 `line`（不含 CR/LF），自动添加一个选定的 Enter 序列：SSH 默认 CR，Telnet 默认 CRLF；可用 `enter:"cr"`、`"lf"` 或 `"crlf"` 覆盖。部分前台 CLI 把 CR、LF 分别视为 Enter，CRLF 有可能触发空行回放，所以 SSH 设备先使用默认 CR。`data` 保留原样，不自动追加或规范化换行；适用于补全、控制字符和分页空格，与 line 互斥。内部 Telnet 编解码负责 IAC 转义。
+
+华为风格提示符可能是 `<host>`、`[~host]`、`[*host]` 或嵌套视图，应匹配实际观察到的完整提示符。例如 `(?m)(<[^>\r\n]+>|\[[^\r\n]*\])\s*$`（这是正则本身，JSON 中反斜杠需再转义）。waitfor 是匹配规则，不能代替正确的提示符或设备命令名。
+
+## 发送确认与防止误重发
+
+空输出、reason=wait/timeout 只表示本次返回时尚未收齐输出，**不表示命令没有执行**。接下来使用 `sess_read`，不要再次提交命令。结果新增：
+
+| 字段 | 含义 |
+|---|---|
+| input_state | sent：传输接受输入；not_sent：未发送；unknown：可能部分发送；duplicate：已识别 input_id，本次没有重发；none：本次未发送输入 |
+| input_seq | 会话内发送尝试序号；重复 ID 返回其原序号，纯读取返回最近序号 |
+| input_bytes | 此序号对应的计划输入字节数，不代表远端已执行次数或已确认发送字节数 |
+| next_action | 如 sess_read 或 reconnect_and_inspect，指导下一步 |
+
+`input_id` 是 exec/interact 的可选防重参数：每个逻辑输入使用新 ID，重试同一输入保持 ID。会话保留最近 128 个不同 ID；相同 ID 与相同字节输入只发送一次，相同 ID 与不同输入报错。发送结果不确定时也记录 ID，防止自动重放。ID 不是 JSON-RPC 请求 ID；它不跨断链重连、重启或缓存淘汰提供保证，也不保证设备只执行一次。未提供 ID 时不会按命令文本去重，因为同一命令可能被有意多次使用。
 
 ## 等待与超时
 
@@ -133,3 +148,5 @@ GOTOOLCHAIN=go1.22.1 sh scripts/build.sh
 测试启动真实本机 TCP/SSH 服务，使用交换机模拟器覆盖配置模式、接口模式、分页、ANSI、分包提示符、串口慢输出和 Telnet IAC。另有 SSH 双流合并/非零退出、历史分页、输入反压、取消与 stdio 队头阻塞测试。长测试建立不发送任何数据、无限保持 TCP 连接的端点，并从 stdio 发出超过两分钟的等待，断言 120s 前得到错误且 ping 不被阻塞。仓库提供 `docs/ci.yml` CI 模板：使用 Go 1.22.1 执行长测试、race 与三目标交叉编译，Windows 单独运行短测试。当前 GitHub 令牌无 workflow 权限，未启用 Actions；有相应权限时将模板复制到 `.github/workflows/ci.yml` 即可。
 
 相关协议/API：[MCP stdio](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)、[MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)、[Go SSH](https://pkg.go.dev/golang.org/x/crypto/ssh)、[Telnet RFC 854](https://www.rfc-editor.org/rfc/rfc854)、[终端类型 RFC 1091](https://www.rfc-editor.org/rfc/rfc1091)、[窗口尺寸 RFC 1073](https://www.rfc-editor.org/rfc/rfc1073)。
+
+现场反馈排查与已验证边界见 [docs/field-report.md](docs/field-report.md)。SSH 状态语义参考 [RFC 4254 §6.10](https://www.rfc-editor.org/rfc/rfc4254.html#section-6.10)。

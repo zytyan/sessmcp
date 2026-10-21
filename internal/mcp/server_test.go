@@ -133,10 +133,15 @@ func TestStdioConcurrencyCancellationAndDevice(t *testing.T) {
 	}
 	c.send(t, "", "notifications/cancelled", map[string]any{"requestId": "read", "reason": "test"})
 	c.receive(t, "read", time.Second)
-	c.tool(t, "command", "sess_interact", map[string]any{"session": id, "data": "show version\r\n", "waitfor": "switch> ", "wait": "1s"})
+	c.tool(t, "command", "sess_interact", map[string]any{"session": id, "line": "show version", "input_id": "show-version-1", "waitfor": "switch> ", "wait": "1s"})
 	s = structured(t, c.receive(t, "command", 2*time.Second))
 	if !strings.Contains(s["output"].(string), "SwitchOS") {
 		t.Fatal(s)
+	}
+	c.tool(t, "retry", "sess_interact", map[string]any{"session": id, "line": "show version", "input_id": "show-version-1"})
+	retry := structured(t, c.receive(t, "retry", time.Second))
+	if retry["input_state"] != "duplicate" || retry["input_seq"] != s["input_seq"] {
+		t.Fatal("MCP retransmitted input", retry)
 	}
 	c.tool(t, "invalid", "sess_interact", map[string]any{"session": id, "data": "x", "extra": "wrong"})
 	v = c.receive(t, "invalid", time.Second)

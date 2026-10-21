@@ -4,6 +4,7 @@ package core
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -37,17 +38,25 @@ type Options struct {
 	Interactive   bool   `json:"interactive,omitempty"`
 }
 type Request struct {
-	Session string `json:"session"`
-	Command string `json:"command,omitempty"`
-	Data    string `json:"data,omitempty"`
-	Wait    string `json:"wait,omitempty"`
-	WaitFor string `json:"waitfor,omitempty"`
-	Timeout string `json:"timeout,omitempty"`
-	All     bool   `json:"all,omitempty"`
-	Tail    int    `json:"tail,omitempty"`
-	Offset  *int64 `json:"offset,omitempty"`
+	Line    *string `json:"line,omitempty"`
+	Enter   string  `json:"enter,omitempty"`
+	InputID string  `json:"input_id,omitempty"`
+	Session string  `json:"session"`
+	Command string  `json:"command,omitempty"`
+	Data    string  `json:"data,omitempty"`
+	Wait    string  `json:"wait,omitempty"`
+	WaitFor string  `json:"waitfor,omitempty"`
+	Timeout string  `json:"timeout,omitempty"`
+	All     bool    `json:"all,omitempty"`
+	Tail    int     `json:"tail,omitempty"`
+	Offset  *int64  `json:"offset,omitempty"`
 }
 type Result struct {
+	InputState   string `json:"input_state"`
+	InputSeq     uint64 `json:"input_seq"`
+	InputBytes   int    `json:"input_bytes"`
+	NextAction   string `json:"next_action,omitempty"`
+	Warning      string `json:"warning,omitempty"`
 	Session      string `json:"session"`
 	Output       string `json:"output"`
 	Reason       string `json:"reason"`
@@ -64,7 +73,22 @@ type Result struct {
 	Truncated    bool   `json:"truncated"`
 	Backpressure bool   `json:"backpressure"`
 }
+type inputRecord struct {
+	digest [32]byte
+	seq    uint64
+	bytes  int
+}
+
+const InputIDLimit = 128
+
 type Session struct {
+	protocol            string
+	inputSeq            uint64
+	inputBytes          int
+	inputs              map[string]inputRecord
+	inputOrder          []string
+	warning             string
+	exitMissing         bool
 	awaiting            bool
 	sentAt              int64
 	id                  string
@@ -113,7 +137,7 @@ func (m *Manager) Connect(ctx context.Context, o Options) (Result, error) {
 	if _, e := rand.Read(b); e != nil {
 		return Result{}, e
 	}
-	s := &Session{id: hex.EncodeToString(b), interactive: o.Interactive || o.Protocol == "telnet", last: time.Now(), connected: true, notify: make(chan struct{}, 1), done: make(chan struct{})}
+	s := &Session{protocol: o.Protocol, id: hex.EncodeToString(b), interactive: o.Interactive || o.Protocol == "telnet", last: time.Now(), connected: true, notify: make(chan struct{}, 1), done: make(chan struct{})}
 	var e error
 	switch o.Protocol {
 	case "ssh":
@@ -132,7 +156,7 @@ func (m *Manager) Connect(ctx context.Context, o Options) (Result, error) {
 	m.mu.Unlock()
 	go s.watch()
 	r := s.snapshot(Request{}, "connected")
-	r.Hint = "Standard SSH servers: prefer exec (interactive=false); SSH exit-status returns immediately. For device shells use interact with waitfor/timeout."
+	r.Hint = "Standard SSH servers: prefer exec (interactive=false); SSH exit-status returns immediately. For network-device shells use interactive=true and interact with line (SSH Enter defaults to CR), input_id, and waitfor/timeout. Empty output after a sent input means poll read, not resend."
 	return r, nil
 }
 func (s *Session) signal() {
@@ -224,7 +248,7 @@ func (m *Manager) List() []Result {
 func (s *Session) status() Result {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return Result{Session: s.id, Connected: s.connected, Running: s.running, Error: s.failure, Total: s.total}
+	return Result{InputState: "none", InputSeq: s.inputSeq, InputBytes: s.inputBytes, Warning: s.warning, Session: s.id, Connected: s.connected, Running: s.running, Error: s.failure, Total: s.total}
 }
 func Duration(v string) (time.Duration, error) {
 	v = strings.ReplaceAll(v, "min", "m")
@@ -282,12 +306,16 @@ func (m *Manager) Run(ctx context.Context, kind string, r Request) (Result, erro
 	if !s.op.TryLock() {
 		v := s.status()
 		v.Reason = "busy"
+		v.NextAction = "sess_read"
+		if r.Command != "" || r.Data != "" || r.Line != nil {
+			v.InputState = "not_sent"
+		}
 		v.Backpressure = true
 		v.Hint = "Another call owns this session; wait for it, or close the session. Do not queue commands."
 		return v, nil
 	}
 	defer s.op.Unlock()
-	if kind == "read" && (r.Command != "" || r.Data != "") {
+	if kind == "read" && (r.Command != "" || r.Data != "" || r.Line != nil || r.Enter != "" || r.InputID != "") {
 		return Result{}, errors.New("read does not accept input")
 	}
 	if kind == "exec" && s.interactive {
@@ -296,14 +324,75 @@ func (m *Manager) Run(ctx context.Context, kind string, r Request) (Result, erro
 	if kind == "interact" && !s.interactive {
 		return Result{}, errors.New("use exec on standard SSH, or reconnect with interactive=true")
 	}
-	if (kind == "exec" && r.Data != "") || (kind == "interact" && r.Command != "") {
-		return Result{}, errors.New("exec accepts command; interact accepts exact data (include newline yourself)")
+	if (kind == "exec" && (r.Data != "" || r.Line != nil || r.Enter != "")) || (kind == "interact" && r.Command != "") {
+		return Result{}, errors.New("exec accepts command; interact accepts line or exact data")
 	}
 	input := r.Data
+	if r.Line != nil {
+		if r.Data != "" {
+			return Result{}, errors.New("line and data are mutually exclusive")
+		}
+		if strings.ContainsAny(*r.Line, "\r\n") {
+			return Result{}, errors.New("line must contain exactly one line without CR/LF; use data for raw input")
+		}
+		enter := r.Enter
+		if enter == "" {
+			enter = "cr"
+			if s.protocol == "telnet" {
+				enter = "crlf"
+			}
+		}
+		switch enter {
+		case "cr":
+			input = *r.Line + "\r"
+		case "lf":
+			input = *r.Line + "\n"
+		case "crlf":
+			input = *r.Line + "\r\n"
+		default:
+			return Result{}, errors.New("enter must be cr, lf or crlf")
+		}
+	} else if r.Enter != "" {
+		return Result{}, errors.New("enter requires line")
+	}
+	if len(r.InputID) > 128 || (r.InputID != "" && input == "" && kind != "exec") {
+		return Result{}, errors.New("input_id requires input and must be at most 128 bytes")
+	}
 	if kind == "exec" {
 		input = r.Command
 		if input == "" {
 			return Result{}, errors.New("command is required")
+		}
+	}
+	inputState := "none"
+	if input != "" {
+		inputState = "not_sent"
+	}
+	var operationSeq uint64
+	var operationBytes int
+	finish := func(v Result) Result {
+		v.InputState = inputState
+		if operationSeq != 0 {
+			v.InputSeq = operationSeq
+			v.InputBytes = operationBytes
+		}
+		return v
+	}
+	digest := sha256.Sum256([]byte(kind + "\x00" + input))
+	if r.InputID != "" {
+		s.mu.Lock()
+		record, found := s.inputs[r.InputID]
+		s.mu.Unlock()
+		if found {
+			if record.digest != digest {
+				return Result{}, errors.New("input_id already used for different input; nothing sent")
+			}
+			inputState = "duplicate"
+			operationSeq = record.seq
+			operationBytes = record.bytes
+			v := s.snapshot(r, "duplicate_input")
+			v.Hint += " This input_id was already attempted; no bytes were sent again. Inspect output and state before issuing a new logical operation."
+			return finish(v), nil
 		}
 	}
 	if len(input) > InputLimit {
@@ -311,7 +400,7 @@ func (m *Manager) Run(ctx context.Context, kind string, r Request) (Result, erro
 		v.Reason = "backpressure"
 		v.Backpressure = true
 		v.Hint = "Input rejected (maximum 4096 bytes). Send a small command, await prompt/echo, then continue. Never paste bulk data to a slow serial endpoint."
-		return v, nil
+		return finish(v), nil
 	}
 	s.mu.Lock()
 	matchStart := s.total
@@ -322,13 +411,13 @@ func (m *Manager) Run(ctx context.Context, kind string, r Request) (Result, erro
 	running := s.running
 	s.mu.Unlock()
 	if !connected {
-		return s.snapshot(r, "disconnected"), nil
+		return finish(s.snapshot(r, "disconnected")), nil
 	}
 	if kind == "exec" && running {
 		v := s.snapshot(r, "busy")
 		v.Backpressure = true
 		v.Hint = "Previous SSH command is still running. Use read; do not replay it."
-		return v, nil
+		return finish(v), nil
 	}
 	if input != "" {
 		s.mu.Lock()
@@ -338,8 +427,24 @@ func (m *Manager) Run(ctx context.Context, kind string, r Request) (Result, erro
 			v := s.snapshot(r, "backpressure")
 			v.Backpressure = true
 			v.Hint = "Previous input has produced no output yet. Poll sess_read before sending more; Ctrl-C/Ctrl-D/Escape remain available. Avoid accumulating serial input."
-			return v, nil
+			return finish(v), nil
 		}
+		s.inputSeq++
+		s.inputBytes = len(input)
+		operationSeq = s.inputSeq
+		operationBytes = len(input)
+		if r.InputID != "" {
+			if s.inputs == nil {
+				s.inputs = make(map[string]inputRecord)
+			}
+			if len(s.inputOrder) == InputIDLimit {
+				delete(s.inputs, s.inputOrder[0])
+				s.inputOrder = s.inputOrder[1:]
+			}
+			s.inputs[r.InputID] = inputRecord{digest: digest, seq: s.inputSeq, bytes: len(input)}
+			s.inputOrder = append(s.inputOrder, r.InputID)
+		}
+		inputState = "unknown"
 		if s.interactive {
 			s.awaiting = true
 			s.sentAt = s.total
@@ -347,6 +452,8 @@ func (m *Manager) Run(ctx context.Context, kind string, r Request) (Result, erro
 		s.running = true
 		if kind == "exec" {
 			s.exit = nil
+			s.exitMissing = false
+			s.warning = ""
 			s.last = started
 		}
 		s.mu.Unlock()
@@ -355,7 +462,10 @@ func (m *Manager) Run(ctx context.Context, kind string, r Request) (Result, erro
 			if kind == "exec" {
 				errc <- s.exec(input)
 			} else {
-				_, err := s.input.Write([]byte(input))
+				n, err := s.input.Write([]byte(input))
+				if err == nil && n != len(input) {
+					err = io.ErrShortWrite
+				}
 				errc <- err
 			}
 		}()
@@ -374,9 +484,13 @@ func (m *Manager) Run(ctx context.Context, kind string, r Request) (Result, erro
 		timer.Stop()
 		if e != nil {
 			s.disconnect(e.Error())
-			return s.snapshot(r, "io_error"), nil
+			return finish(s.snapshot(r, "io_error")), nil
 		}
 	}
+	if input != "" {
+		inputState = "sent"
+	}
+
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -384,6 +498,7 @@ func (m *Manager) Run(ctx context.Context, kind string, r Request) (Result, erro
 		last := s.last
 		conn := s.connected
 		run := s.running
+		missing := s.exitMissing
 		from := matchStart
 		if from < s.base {
 			from = s.base
@@ -400,6 +515,9 @@ func (m *Manager) Run(ctx context.Context, kind string, r Request) (Result, erro
 			reason = "disconnected"
 		case !s.interactive && !run:
 			reason = "exit"
+			if missing {
+				reason = "exit_status_missing"
+			}
 		case now.Sub(last) >= IdleLimit:
 			s.disconnect("endpoint_idle: no stdout/stderr for 110s; reconnect")
 			reason = "endpoint_idle"
@@ -419,11 +537,11 @@ func (m *Manager) Run(ctx context.Context, kind string, r Request) (Result, erro
 				s.awaiting = false
 				s.mu.Unlock()
 			}
-			return s.snapshot(r, reason), nil
+			return finish(s.snapshot(r, reason)), nil
 		}
 		select {
 		case <-ctx.Done():
-			return s.snapshot(r, "cancelled"), nil
+			return finish(s.snapshot(r, "cancelled")), nil
 		case <-s.notify:
 		case <-ticker.C:
 		}
@@ -473,13 +591,22 @@ func (s *Session) snapshot(r Request, reason string) Result {
 	if !r.All && r.Tail == 0 && r.Offset == nil {
 		s.cursor = end
 	}
-	v := Result{Session: s.id, Output: out, Reason: reason, Connected: s.connected, Running: s.running, ExitCode: s.exit, Error: s.failure, Start: from, End: end, Total: s.total, RetainedFrom: s.base, More: end < s.total, Truncated: lost || (r.All && s.base > 0)}
+	v := Result{InputState: "none", InputSeq: s.inputSeq, InputBytes: s.inputBytes, Warning: s.warning, Session: s.id, Output: out, Reason: reason, Connected: s.connected, Running: s.running, ExitCode: s.exit, Error: s.failure, Start: from, End: end, Total: s.total, RetainedFrom: s.base, More: end < s.total, Truncated: lost || (r.All && s.base > 0)}
 	if !s.connected {
+		v.NextAction = "reconnect_and_inspect"
 		v.Hint = "Connection closed. Call connect to create a new session; do not blindly replay commands."
 	}
 	if v.More || v.Truncated {
 		v.Backpressure = true
 		v.Hint += " Output bounded: fetch more using read with offset=end (or default incremental read). Reduce remote verbosity."
+	}
+	if s.running && s.connected {
+		v.NextAction = "sess_read"
+		v.Hint += " Input may already be executing, even when output is empty. Poll sess_read; do not resend."
+	}
+	if s.exitMissing && s.connected {
+		v.NextAction = "inspect_output"
+		v.Hint += " SSH channel closed without exit status; success is unknown. For network devices, connect with interactive=true; do not replay automatically."
 	}
 	if s.interactive && s.running {
 		v.Backpressure = true

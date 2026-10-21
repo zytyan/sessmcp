@@ -120,8 +120,18 @@ func (s *Session) connectSSH(ctx context.Context, o Options) error {
 				_ = sh.Close()
 				code := 0
 				var exit *ssh.ExitError
+				var missing *ssh.ExitMissingError
 				if e != nil {
-					if errors.As(e, &exit) {
+					if errors.As(e, &missing) {
+						s.mu.Lock()
+						s.exit = nil
+						s.exitMissing = true
+						s.warning = "SSH channel closed without exit-status/exit-signal; command outcome is unknown"
+						s.running = false
+						s.mu.Unlock()
+						s.signal()
+						return
+					} else if errors.As(e, &exit) {
 						code = exit.ExitStatus()
 					} else {
 						s.disconnect(fmt.Sprintf("SSH command transport error: %v; reconnect", e))

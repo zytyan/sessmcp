@@ -115,7 +115,8 @@ func TelnetSwitch(t *testing.T) string {
 		Switch(tc)
 	})
 }
-func SSH(t *testing.T) (string, string) {
+func SSH(t *testing.T) (string, string) { return SSHWithShell(t, Switch) }
+func SSHWithShell(t *testing.T, shell func(io.ReadWriter)) (string, string) {
 	t.Helper()
 	_, key, e := ed25519.GenerateKey(rand.Reader)
 	if e != nil {
@@ -157,7 +158,7 @@ func SSH(t *testing.T) (string, string) {
 						_ = req.Reply(true, nil)
 					case "shell":
 						_ = req.Reply(true, nil)
-						Switch(ch)
+						shell(ch)
 						return
 					case "exec":
 						var p struct{ Command string }
@@ -170,6 +171,9 @@ func SSH(t *testing.T) (string, string) {
 						case "both":
 							_, _ = io.WriteString(ch, "stdout\n")
 							_, _ = io.WriteString(ch.Stderr(), "stderr\n")
+						case "missing-status":
+							_, _ = io.WriteString(ch, "device output\n")
+							return
 						case "exit7":
 							code = 7
 							_, _ = io.WriteString(ch.Stderr(), "failed\n")

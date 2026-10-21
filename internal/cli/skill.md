@@ -1,47 +1,86 @@
 ---
 name: sessmcp
-description: Operate persistent SSH/Telnet sessions through sessmcp MCP tools, including device consoles, pagers and bounded waits.
+description: Operate persistent SSH/Telnet sessions through sessmcp, including device consoles, incremental reads, input receipts and retry deduplication.
 ---
 
 # sessmcp MCP operating skill
 
-Configure an MCP stdio server: executable `sessmcp`, args `["serve"]`.
-Optional audit: `["serve", "--log", "/private/path/audit.jsonl"]`.
-Audit redacts authentication fields, but commands/data may contain secrets.
+Configure an MCP stdio server with executable `sessmcp`, args `["serve"]`.
+Audit: `["serve", "--log", "/private/path/audit.jsonl"]`. Authentication fields are redacted;
+commands, line and data may still contain secrets.
 
-1. `sess_connect` creates a process-local handle. Supply protocol and address (host:port).
-   SSH requires user, password or key_file, plus known_hosts or host_key SHA256 fingerprint.
-   Use insecure=true only when the user explicitly intends to skip verification.
-2. For ordinary SSH servers ALWAYS prefer interactive=false (default) and `sess_exec`.
-   SSH exit-status/exit-signal determines completion, with merged stdout/stderr. No sentinel markers.
-   Each exec uses a new channel over the same connection: cwd/environment do not persist.
-   Example: {"session":"HANDLE","command":"uname -a","wait":"30s"}.
-3. For Telnet and SSH switch/router consoles, set interactive=true and use `sess_interact`.
-   `data` is exact input: include newline yourself, e.g. "show version\r\n".
-   Login to Telnet by matching "Username:"/"Password:" then sending one field at a time.
-   Example: {"session":"HANDLE","data":"show version\r\n","waitfor":"(?m)switch[#>]\\s*$","timeout":"800ms","wait":"30s"}.
-   For pagers match "--More--", send a single space, and wait for the next page/prompt.
-4. Wait conditions are OR: SSH completion, waitfor Go RE2 regex on NEW output, fixed wait
-   from invocation, or timeout since last OUTPUT refresh. Input does not refresh timeout.
-   Default wait=5s, even with waitfor/timeout. Override wait to wait longer. Positive durations:
-   100ms, 30s, 1min. A call is capped at 115s, even if output continues.
-   Endpoint stdout/stderr silence for 110s disconnects with error. Do not use an infinite wait.
-5. Results are incremental by default. If running=true on SSH exec, use sess_read to poll;
-   do NOT execute the command again. Cancellation stops waiting, not the remote command.
-   `sess_close` closes a blocked connection without waiting for its operation lock.
-6. Inspect connected, error, reason, backpressure, more, truncated, retained_from, end and exit_code.
-   On disconnect, create a NEW session and assess remote state before retrying side effects.
-   On busy/backpressure, do not queue/replay input. Max 4096 input bytes; send one SMALL command
-   per prompt/echo on serial/slow devices. An accepted write does not mean the device consumed it.
-7. Default reads advance a shared per-session byte cursor. `all:true` reads retained history;
-   `tail:100` gets last 100 retained lines. History is bounded to 1MiB; response cap is 64KiB.
-   To retrieve the next page use sess_read with offset equal to the last result's end.
-   Explicit all/tail/offset do not advance the default cursor. Truncation is reported, never hidden.
-   Polling matches unread output (including bytes arriving between calls); input calls match only output received after invocation.
-   Additional input is rejected while the previous write has produced no output; Ctrl-C/Ctrl-D/Escape remain available.
-8. `sess_list` inspects connections; `sess_close` releases them. Maximum 32 sessions and 32
-   concurrent tool calls. Remote calls are concurrent across sessions; same-session contention
-   returns busy immediately. Ping/cancellation/listing remain available during waits.
+## Choose the mode before sending commands
 
-The stdio transport uses bounded frames/queues and a 3s output-write deadline. If the MCP client
-stops reading stdout, the server exits instead of hanging. Reconnect sessions after restart.
+- Ordinary SSH server: `sess_connect` with interactive=false (default), then `sess_exec`.
+  Supply protocol, address (host:port), SSH user, password/key_file and known_hosts/host_key.
+  Use insecure=true only with explicit user intent to skip host-key verification.
+  Each exec uses a new channel over the persistent transport; cwd/environment do not persist.
+- Switch/router CLI, including Huawei-style consoles: connect with interactive=true, then
+  `sess_interact`. Do not probe by executing the same command first in exec and then in a shell.
+- Telnet is always interactive. Login by matching Username/Password prompts and sending one field
+  at a time; never guess or automatically replay the device's authentication flow.
+
+## Send one logical command, then read its result
+
+Prefer `line` without newline characters for a single console command:
+
+```json
+{"session":"HANDLE","line":"display version","input_id":"inspect-version-1","waitfor":"(?m)(<[^>\r\n]+>|\\[[^\r\n]*\\])\\s*$","wait":"30s"}
+```
+
+`line` appends the selected Enter exactly once: SSH defaults to CR, Telnet defaults to CRLF.
+Set enter="cr"/"lf"/"crlf" only when the device requires it. Some consoles treat CR and LF as
+separate Enters; CRLF can then trigger an empty-line replay. SSH devices should start with CR.
+Do not add CR/LF to line; it rejects embedded line breaks. `line` and raw `data` are exclusive.
+Use raw data for controls, tab completion, pagination (a single space), or deliberate byte sequences;
+raw data is never normalized or given an extra newline. JSON escapes must represent real control
+characters, e.g. data="diagnose\r"; do not send literal backslash-r.
+
+Give every logical command a unique input_id and keep it if retrying that same input. Within a
+session's last 128 distinct IDs, the server rejects changed input under an old ID and suppresses
+retransmission of the same input, even after an uncertain send. input_id is optional and distinct
+from JSON-RPC request id. Deduplication does not survive eviction, reconnect or process restart.
+Without input_id, two identical calls remain two intentional sends; do not repeat on empty output.
+
+Read the receipt before deciding what to do next:
+
+| input_state | Meaning | Action |
+|---|---|---|
+| sent | Transport accepted input; device completion is not implied | Read output, then sess_read if needed |
+| not_sent | Busy/backpressure rejected this input before sending | Read prior operation; do not queue more input |
+| unknown | Send failed/timed out and may have partially executed | Inspect remote state before another input |
+| duplicate | Existing input_id was recognized; no new input was sent | Inspect output; poll sess_read |
+| none | This call sent no input (read/list/connect) | input_seq refers to the latest session input |
+
+input_seq identifies the send attempt; input_bytes is its intended byte count, not a confirmed
+remote-execution count. When next_action="sess_read", call sess_read without command/line/data.
+**An empty output or reason=wait/timeout is never evidence that a command was not executed.**
+For SSH exec, running=true means the original command is still active: poll, never resubmit.
+If reason=exit_status_missing, the SSH channel closed without exit status. Preserve and inspect
+its output; success is unknown. The transport is retained unless actually disconnected. For future
+network-device commands use an interactive connection, without automatically replaying this command.
+
+## Waits, prompts and history
+
+wait is fixed time from invocation (default 5s), timeout is output silence, waitfor is Go RE2 regex.
+These conditions and SSH completion are OR. Set wait explicitly when 5s is too short; duration
+examples: 100ms, 30s, 1min. Calls are capped at 115s; endpoint output silence for 110s disconnects.
+Sending input does not refresh the output clock; timeout is bounded below by the current call start.
+A waitfor match is only as reliable as the pattern. Huawei-style prompts may contain ~ or * and
+change between <host>, [~host], [*host] and nested views. Match an observed full prompt, not a guessed
+mode name or arbitrary command echo. Device command names vary; use device help rather than guessing.
+Polling matches unread output, including bytes arriving between calls; input calls match new output.
+
+Results are incremental and share one per-session cursor. For retained history use all=true,
+tail=N, or offset=end to page. History is at most 1MiB; response output at most 64KiB. Inspect more,
+truncated and retained_from. Explicit all/tail/offset do not move the default cursor.
+
+Respect backpressure: at most one small command per prompt; input max 4096 bytes. New ordinary
+input is rejected if the preceding write produced no output; Ctrl-C/Ctrl-D/Escape remain available.
+An echo is not proof the device has completed the command. Never queue bulk serial input.
+
+Use sess_list to inspect connections, sess_close to release them or abort a blocked connection.
+Cancellation stops waiting, not the remote command. On connected=false, reconnect and inspect state
+before retrying side effects. Maximum 32 sessions and 32 tool workers. Across-session waits are
+concurrent; same-session contention returns busy. A non-reading stdout consumer causes the server
+to exit after 3s instead of deadlocking. Restarting requires new remote connections.
