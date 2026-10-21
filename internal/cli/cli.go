@@ -21,7 +21,7 @@ import (
 //go:embed skill.md
 var Skill string
 
-const Help = `sessmcp — 面向 AI Agent 的持久 SSH / Telnet MCP 工具 (Go 1.22.5+)
+const Help = `sessmcp — 面向 AI Agent 的持久 SSH / Telnet MCP 工具 (Go 1.22.1+)
 
 用法:
   sessmcp help                         查看用途和子命令

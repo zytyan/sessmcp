@@ -1,7 +1,7 @@
 # sessmcp 开发约束
 
-- 优先复用成熟连接库：SSH 使用 golang.org/x/crypto/ssh，Telnet 使用 github.com/ziutek/telnet；禁止自写连接协议。
-- Go 1.22（最低补丁版本 1.22.5），纯 Go、CGO_ENABLED=0；依赖不得要求高于 Go 1.22。
+- SSH 复用 golang.org/x/crypto/ssh。用户最新要求：Telnet 使用内部实现，禁止重新引入要求更高 Go 补丁版本的 Telnet 库。
+- Go 1.22（固定目标补丁版本 1.22.1），纯 Go、CGO_ENABLED=0；依赖不得要求高于 Go 1.22。
 - 交叉编译 linux/amd64、linux/arm64、windows/amd64。
 - 进程内持久 SSH/Telnet 连接；无需重启恢复。标准 SSH 优先 exec，以 SSH exit-status/exit-signal 判断完成，合并 stdout/stderr，禁止结束标记猜测。
 - 交互等待支持 wait 固定时间（从调用开始）、waitfor 正则、timeout 输出静默时间；按用户“任意条件达成返回”实现 OR。默认 wait=5s，可显式覆盖；任何调用不得无限等待。

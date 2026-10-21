@@ -1,6 +1,6 @@
 # sessmcp
 
-面向 AI Agent 的 Go MCP 工具，支持进程内持久 SSH / Telnet 连接、交换机等交互终端、有界等待与增量输出。**Go 1.22.5+，纯 Go，无 CGO。**
+面向 AI Agent 的 Go MCP 工具，支持进程内持久 SSH / Telnet 连接、交换机等交互终端、有界等待与增量输出。**Go 1.22.1+，纯 Go，无 CGO。**
 
 ```sh
 go build -buildvcs=false -o sessmcp ./cmd/sessmcp
@@ -66,7 +66,7 @@ SSH 连接设置 `interactive:true`；Telnet 连接天然是交互式。Telnet �
 {"session":"HANDLE","data":"show version\r\n","waitfor":"(?m)switch[#>]\\s*$","timeout":"800ms","wait":"30s"}
 ```
 
-匹配 `--More--` 后发送一个空格读取下一页。`data` 保留原样，Telnet 库负责 IAC 转义；不自动追加回车。
+匹配 `--More--` 后发送一个空格读取下一页。`data` 保留原样，内部 Telnet 编解码负责 IAC 转义；不自动追加回车。
 
 ## 等待与超时
 
@@ -108,18 +108,18 @@ stdio 的单流本身无法越过不读取的消费者传输数据：如果 stdo
 
 ## 依赖与 Go 1.22
 
-连接层复用 `golang.org/x/crypto/ssh v0.33.0` 和 `github.com/ziutek/telnet v0.1.0`，不自写 SSH/Telnet 协议。后者最低要求 Go 1.22.5，因此用 Go 1.22.12 验证。go.mod / go.sum 固定兼容版本，不使用要求更高 Go 版本的最新版 SDK；MCP stdio 层实现所需的 JSON-RPC 方法，支持协商 2024-11-05、2025-03-26、2025-06-18、2025-11-25。
+SSH 连接层复用 `golang.org/x/crypto/ssh v0.33.0`。Telnet 使用 `internal/telnet` 内部实现，无外部 Telnet 依赖，固定使用 **Go 1.22.1** 验证。它处理跨包 IAC、字面 IAC 转义、WILL/WONT/DO/DONT 与重复协商抑制，支持 BINARY、ECHO、SGA、终端类型 vt100 和 80×24 窗口尺寸；拒绝不支持的选项。子协商最多 8192 字节，异常转义或超限会报错断开。应用数据与协商回复都受到独立写入超时保护，已解码输出不会被未完整到达的控制序列扣住。go.mod / go.sum 固定兼容版本，不使用要求更高 Go 版本的最新版 SDK；MCP stdio 层实现所需的 JSON-RPC 方法，支持协商 2024-11-05、2025-03-26、2025-06-18、2025-11-25。
 
 ## 编译与测试
 
 ```sh
 # 指定真实 Go 1.22 工具链验证（第一次会下载工具链）
-GOTOOLCHAIN=go1.22.12 go test ./...
-GOTOOLCHAIN=go1.22.12 go vet ./...
-GOTOOLCHAIN=go1.22.12 SESSMCP_LONG_TEST=1 go test -race ./... -count=1 -timeout 4m
+GOTOOLCHAIN=go1.22.1 go test ./...
+GOTOOLCHAIN=go1.22.1 go vet ./...
+GOTOOLCHAIN=go1.22.1 SESSMCP_LONG_TEST=1 go test -race ./... -count=1 -timeout 4m
 
 # 一次编译全部目标，CGO_ENABLED=0
-GOTOOLCHAIN=go1.22.12 sh scripts/build.sh
+GOTOOLCHAIN=go1.22.1 sh scripts/build.sh
 ```
 
 产物与 SHA256SUMS 位于 dist/：
@@ -130,6 +130,6 @@ GOTOOLCHAIN=go1.22.12 sh scripts/build.sh
 
 也可直接使用 `CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ./cmd/sessmcp` 等标准交叉编译命令。
 
-测试启动真实本机 TCP/SSH 服务，使用交换机模拟器覆盖配置模式、接口模式、分页、ANSI、分包提示符、串口慢输出和 Telnet IAC。另有 SSH 双流合并/非零退出、历史分页、输入反压、取消与 stdio 队头阻塞测试。长测试建立不发送任何数据、无限保持 TCP 连接的端点，并从 stdio 发出超过两分钟的等待，断言 120s 前得到错误且 ping 不被阻塞。仓库提供 `docs/ci.yml` CI 模板：使用 Go 1.22.12 执行长测试、race 与三目标交叉编译，Windows 单独运行短测试。当前 GitHub 令牌无 workflow 权限，未启用 Actions；有相应权限时将模板复制到 `.github/workflows/ci.yml` 即可。
+测试启动真实本机 TCP/SSH 服务，使用交换机模拟器覆盖配置模式、接口模式、分页、ANSI、分包提示符、串口慢输出和 Telnet IAC。另有 SSH 双流合并/非零退出、历史分页、输入反压、取消与 stdio 队头阻塞测试。长测试建立不发送任何数据、无限保持 TCP 连接的端点，并从 stdio 发出超过两分钟的等待，断言 120s 前得到错误且 ping 不被阻塞。仓库提供 `docs/ci.yml` CI 模板：使用 Go 1.22.1 执行长测试、race 与三目标交叉编译，Windows 单独运行短测试。当前 GitHub 令牌无 workflow 权限，未启用 Actions；有相应权限时将模板复制到 `.github/workflows/ci.yml` 即可。
 
-相关协议/API：[MCP stdio](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)、[MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)、[Go SSH](https://pkg.go.dev/golang.org/x/crypto/ssh)、[Go Telnet](https://pkg.go.dev/github.com/ziutek/telnet)。
+相关协议/API：[MCP stdio](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)、[MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)、[Go SSH](https://pkg.go.dev/golang.org/x/crypto/ssh)、[Telnet RFC 854](https://www.rfc-editor.org/rfc/rfc854)、[终端类型 RFC 1091](https://www.rfc-editor.org/rfc/rfc1091)、[窗口尺寸 RFC 1073](https://www.rfc-editor.org/rfc/rfc1073)。

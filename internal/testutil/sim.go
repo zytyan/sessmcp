@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ziutek/telnet"
+	"github.com/zytyan/sessmcp/internal/telnet"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -106,15 +106,12 @@ func Switch(rw io.ReadWriter) {
 	}
 }
 func TelnetSwitch(t *testing.T) string {
-	return Listen(t, func(c net.Conn) { // Split IAC negotiation across writes and read the library's response.
+	return Listen(t, func(c net.Conn) { // Split IAC negotiation across TCP writes.
 		for _, b := range []byte{255, 251, 1} {
 			_, _ = c.Write([]byte{b})
 			time.Sleep(time.Millisecond)
 		}
-		tc, e := telnet.NewConn(c)
-		if e != nil {
-			return
-		}
+		tc := telnet.NewConn(c, 10*time.Second)
 		Switch(tc)
 	})
 }

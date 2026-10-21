@@ -1,5 +1,3 @@
-github.com/ziutek/telnet v0.1.0 h1:Fds2AqweYyoRHX/5X8ikiyqIcSl156Sf2xCvURfqXHA=
-github.com/ziutek/telnet v0.1.0/go.mod h1:3M/h4qudUBZA8n+N4ywQIu2auiHUJNdqLUIKDAbG2M4=
 golang.org/x/crypto v0.33.0 h1:IOBPskki6Lysi0lo9qQvbxiQ+FvsCC/YWOecCHAixus=
 golang.org/x/crypto v0.33.0/go.mod h1:bVdXmD7IV/4GdElGPozy6U7lWdRXA4qyRVGJV57uQ5M=
 golang.org/x/sys v0.30.0 h1:QjkSwP/36a20jFYWkSue1YwXzLmsV5Gfq7Eiy72C1uc=
